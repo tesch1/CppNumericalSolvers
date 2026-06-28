@@ -5,6 +5,8 @@
 #include <iostream>
 #include <limits>
 #include <list>
+#include <string>
+#include <type_traits>
 
 #include "cppoptlib/function.h"
 #include "cppoptlib/solver/augmented_lagrangian.h"
@@ -155,15 +157,35 @@ class NelderMeadTest : public testing::Test {};
   EXPECT_NEAR(fx, f(solution.x), PRECISION);
 
 typedef ::testing::Types<double> DoublePrecision;
-TYPED_TEST_SUITE(GradientDescentTest, DoublePrecision);
-TYPED_TEST_SUITE(ConjugatedGradientDescentTest, DoublePrecision);
-TYPED_TEST_SUITE(NewtonDescentTest, DoublePrecision);
-TYPED_TEST_SUITE(BfgsTest, DoublePrecision);
-TYPED_TEST_SUITE(LbfgsTest, DoublePrecision);
+
+// gtest's TYPED_TEST_SUITE takes an optional third argument: a type-name
+// generator (a class with a static template `GetName<T>(int)`).  We supply
+// one explicitly rather than relying on the default.  Doing so makes the
+// macro's trailing `__VA_ARGS__` non-empty, which keeps the invocation
+// strictly ISO C++ conforming under `-Wpedantic` -- an empty variadic
+// macro argument is a GNU extension that `-Wpedantic -Werror` rejects.
+// As a bonus the generator gives each typed-test instantiation a readable
+// scalar-type suffix instead of a bare numeric index.
+class ScalarTypeName {
+ public:
+  template <typename T>
+  static std::string GetName(int) {
+    if (std::is_same<T, double>::value) return "double";
+    if (std::is_same<T, float>::value) return "float";
+    return "scalar";
+  }
+};
+
+TYPED_TEST_SUITE(GradientDescentTest, DoublePrecision, ScalarTypeName);
+TYPED_TEST_SUITE(ConjugatedGradientDescentTest, DoublePrecision,
+                 ScalarTypeName);
+TYPED_TEST_SUITE(NewtonDescentTest, DoublePrecision, ScalarTypeName);
+TYPED_TEST_SUITE(BfgsTest, DoublePrecision, ScalarTypeName);
+TYPED_TEST_SUITE(LbfgsTest, DoublePrecision, ScalarTypeName);
 #if EIGEN_VERSION_AT_LEAST(3, 4, 0)
-TYPED_TEST_SUITE(LbfgsbTest, DoublePrecision);
+TYPED_TEST_SUITE(LbfgsbTest, DoublePrecision, ScalarTypeName);
 #endif
-TYPED_TEST_SUITE(NelderMeadTest, DoublePrecision);
+TYPED_TEST_SUITE(NelderMeadTest, DoublePrecision, ScalarTypeName);
 
 #define SOLVER_SETUP(sol, func)                                               \
   TYPED_TEST(sol##Test, func##Far){SOLVE_PROBLEM(                             \
@@ -208,7 +230,7 @@ class SimpleFunction : public FunctionX2<T, SimpleFunction<T>> {
 
 template <class T>
 class CentralDifference : public testing::Test {};
-TYPED_TEST_SUITE(CentralDifference, DoublePrecision);
+TYPED_TEST_SUITE(CentralDifference, DoublePrecision, ScalarTypeName);
 
 TYPED_TEST(CentralDifference, Gradient) {
   typename SimpleFunction<TypeParam>::VectorType x0(2);
@@ -281,7 +303,7 @@ class Circle : public Function2d<Circle> {
 
 template <class T>
 class Constrained : public testing::Test {};
-TYPED_TEST_SUITE(Constrained, DoublePrecision);
+TYPED_TEST_SUITE(Constrained, DoublePrecision, ScalarTypeName);
 TYPED_TEST(Constrained, Simple) {
   constexpr auto dim = 2;
   SumObjective::VectorType x(dim);

@@ -410,6 +410,15 @@ TEST(TrustRegionNewton, DynamicDimensionStrictlyConvexConverges) {
   ASSERT_EQ(solution.x.size(), 2);
   EXPECT_NEAR(solution.x(0), 0.0, 1e-8);
   EXPECT_NEAR(solution.x(1), 0.0, 1e-8);
+  // The dynamic path must converge within its iteration budget rather
+  // than stall or exhaust it.  Which convergence criterion fires
+  // (gradient-norm vs. x-delta) depends on Hessian conditioning, so we
+  // assert the stable invariant -- not `IterationLimit` -- instead of a
+  // specific success status.  Before the dim_ fix this test never
+  // reached this assertion: it crashed inside the CG-Steihaug
+  // subproblem solver on a size-0 step vector.
+  EXPECT_NE(progress.status, cppoptlib::solver::Status::IterationLimit);
+  EXPECT_LT(progress.num_iterations, static_cast<std::size_t>(50));
 }
 
 TEST(TrustRegionNewton, DynamicDimensionHigherDimConverges) {
@@ -424,6 +433,8 @@ TEST(TrustRegionNewton, DynamicDimensionHigherDimConverges) {
 
   ASSERT_EQ(solution.x.size(), 5);
   EXPECT_LT(solution.x.norm(), 1e-6);
+  EXPECT_NE(progress.status, cppoptlib::solver::Status::IterationLimit);
+  EXPECT_LT(progress.num_iterations, static_cast<std::size_t>(100));
 }
 
 int main(int argc, char** argv) {
