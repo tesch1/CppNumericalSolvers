@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 #include "../linesearch/more_thuente.h"
@@ -290,9 +291,24 @@ class Lbfgs
     const ScalarType grad_diff_norm_sq = grad_diff.dot(grad_diff);
     if (grad_diff_norm_sq > eps) {
       const ScalarType temp_scaling = grad_diff.dot(x_diff) / grad_diff_norm_sq;
+      // Accept only genuinely positive, finite, sane-magnitude estimates.
+      // Two failure modes are deliberately excluded:
+      //   * `temp_scaling <= 0` -- a negative-curvature step carries no
+      //     usable `H_0` information; the earlier `max(temp, eps)` clamp
+      //     silently replaced the previous (valid) scaling with machine
+      //     epsilon, which detonated the direction scale on the next
+      //     iteration.
+      //   * flooring tiny positive values at `eps` -- ultra-stiff problems
+      //     (CUTEst SCURLY/SCOSINE families, |f| ~ 1e70) legitimately need
+      //     `gamma` far below machine epsilon.  Clamping it up left the
+      //     search direction tens of orders of magnitude too long, and
+      //     every Moré-Thuente call burned ~12 evaluations shrinking the
+      //     step back down.  `gamma` multiplies the direction, so any
+      //     positive normal value is numerically safe.
       if (std::isfinite(temp_scaling) &&
+          temp_scaling >= std::numeric_limits<ScalarType>::min() &&
           std::abs(temp_scaling) <= fallback_value) {
-        scaling_factor_ = std::max(temp_scaling, eps);
+        scaling_factor_ = temp_scaling;
       }
       // else: keep previous scaling_factor_.
     }

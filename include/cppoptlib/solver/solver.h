@@ -29,6 +29,7 @@
 
 #include <stdint.h>
 
+#include <algorithm>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -189,6 +190,39 @@ class Solver {
     StateType current_function_state = function_state;
     if constexpr (IsFunctionState<StateType>::value) {
       current_function_state = StateType(function, function_state.x);
+    }
+
+    // Check the gradient-norm criterion at the user-supplied starting
+    // point before doing any work.  Reference implementations (Nocedal
+    // `lbfgs_um`, libLBFGS, LBFGS-Lite) test convergence on the initial
+    // gradient and return immediately when the start is already
+    // stationary; without this check the solver burns a full line search
+    // (up to `maxfev` evaluations) discovering that no descent exists.
+    // Only the gradient test applies here -- the x-delta / f-delta /
+    // plateau tests all compare two successive iterates and are
+    // meaningless at iteration zero.
+    if constexpr (IsFunctionState<StateType>::value &&
+                  FunctionType::Differentiability >=
+                      cppoptlib::function::DifferentiabilityMode::First) {
+      if (stopping_progress.gradient_norm > 0) {
+        using ScalarType = typename FunctionType::ScalarType;
+        const ScalarType initial_gradient_norm =
+            current_function_state.gradient.template lpNorm<Eigen::Infinity>();
+        const ScalarType scale =
+            stopping_progress.gradient_norm_relative
+                ? std::max<ScalarType>(ScalarType(1),
+                                       current_function_state.x
+                                           .template lpNorm<Eigen::Infinity>())
+                : ScalarType(1);
+        if (initial_gradient_norm < stopping_progress.gradient_norm * scale) {
+          ProgressType initial_solver_state;
+          initial_solver_state.gradient_norm = initial_gradient_norm;
+          initial_solver_state.status = Status::GradientNormViolation;
+          this->step_callback_(function, current_function_state,
+                               initial_solver_state);
+          return {current_function_state, initial_solver_state};
+        }
+      }
     }
 
     this->InitializeSolver(function, function_state);
