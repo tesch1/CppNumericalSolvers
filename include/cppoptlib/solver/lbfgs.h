@@ -75,6 +75,7 @@ class Lbfgs
     const size_t dim = initial_state.x.rows();
     x_diff_memory_ = memory_MatrixType::Zero(dim, m);
     grad_diff_memory_ = memory_MatrixType::Zero(dim, m);
+    rho_memory_ = memory_VectorType::Zero();
     alpha.resize(m);
     // Scratch buffers used every outer iteration.  Pre-sizing them
     // once here avoids a malloc/free pair per OptimizationStep call.
@@ -161,13 +162,15 @@ class Lbfgs
       // mem_count_-1]. When full, they are stored cyclically starting at
       // mem_pos_ (oldest) up to (mem_pos_ + m - 1) mod m.
       int idx = static_cast<int>(mem_count_ < m ? i : ((mem_pos_ + i) % m));
-      const ScalarType denom =
-          x_diff_memory_.col(idx).dot(grad_diff_memory_.col(idx));
-      if (std::abs(denom) < eps) {
-        continue;
-      }
-      const ScalarType rho = ScalarType(1) / denom;
-      alpha(i) = rho * x_diff_memory_.col(idx).dot(search_direction);
+      // `rho = 1 / s^T y` was computed once at pair insertion, where the
+      // curvature guard `s^T y > eps * ||s|| * ||y||` already established
+      // that the denominator is positive with a relative margin.  The
+      // previous per-iteration recomputation guarded with an *absolute*
+      // `|s^T y| < eps` test, which silently dropped perfectly valid
+      // pairs on small-scale problems (`||s|| * ||y|| << 1` near
+      // convergence) and cost two extra dot products per pair per
+      // iteration.
+      alpha(i) = rho_memory_(idx) * x_diff_memory_.col(idx).dot(search_direction);
       search_direction -= alpha(i) * grad_diff_memory_.col(idx);
     }
 
@@ -185,14 +188,8 @@ class Lbfgs
     // --- Second Loop (Forward Pass) ---
     for (int i = 0; i < k; i++) {
       int idx = static_cast<int>(mem_count_ < m ? i : ((mem_pos_ + i) % m));
-      const ScalarType denom =
-          x_diff_memory_.col(idx).dot(grad_diff_memory_.col(idx));
-      if (std::abs(denom) < eps) {
-        continue;
-      }
-      const ScalarType rho = ScalarType(1) / denom;
       const ScalarType beta =
-          rho * grad_diff_memory_.col(idx).dot(search_direction);
+          rho_memory_(idx) * grad_diff_memory_.col(idx).dot(search_direction);
       search_direction += x_diff_memory_.col(idx) * (alpha(i) - beta);
     }
 
@@ -266,16 +263,21 @@ class Lbfgs
     const ScalarType sy = x_diff.dot(grad_diff);
     const ScalarType sy_threshold = eps * x_diff.norm() * grad_diff.norm();
     if (sy > sy_threshold) {
-      // Add the new correction pair into the circular buffer.
+      // Add the new correction pair (and its precomputed `rho = 1 / s^T y`)
+      // into the circular buffer.  The guard above establishes `sy > 0`
+      // with a relative margin, so the division is safe.
+      const ScalarType rho_new = ScalarType(1) / sy;
       if (mem_count_ < static_cast<size_t>(m)) {
         // Still have free space.
         x_diff_memory_.col(mem_count_) = x_diff;
         grad_diff_memory_.col(mem_count_) = grad_diff;
+        rho_memory_(mem_count_) = rho_new;
         mem_count_++;
       } else {
         // Buffer full; overwrite the oldest correction.
         x_diff_memory_.col(mem_pos_) = x_diff;
         grad_diff_memory_.col(mem_pos_) = grad_diff;
+        rho_memory_(mem_pos_) = rho_new;
         mem_pos_ = (mem_pos_ + 1) % m;
       }
     }
@@ -321,6 +323,9 @@ class Lbfgs
  private:
   memory_MatrixType x_diff_memory_;
   memory_MatrixType grad_diff_memory_;
+  // Precomputed `rho_i = 1 / s_i^T y_i` for each stored pair, filled at
+  // insertion time (where positivity is guaranteed by the curvature guard).
+  memory_VectorType rho_memory_;
   // Circular buffer state:
   size_t mem_count_ = 0;  // Number of corrections stored so far (max m).
   size_t mem_pos_ = 0;    // Index of the oldest correction in the buffer.
