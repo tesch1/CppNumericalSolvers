@@ -257,34 +257,7 @@ class Solver {
         }
       }
 
-      // Let a caller move the accepted iterate before it is judged.  This is
-      // what makes a projected-gradient method possible when the feasible set
-      // is not the box the solver was given: our rf constraint is
-      // |rf| <= b1max, a disc, and the cartesian box's corner sits outside it
-      // at sqrt(2) b1max.  Folding the projection into the objective instead
-      // leaves the solver's own variables drifting on a plateau that maps to
-      // the same point, which converges far worse.
-      //
-      // Deliberately not `step_callback_`: that one is an observer (it takes
-      // the state by const reference, and PrintProgressCallback relies on
-      // that).  A modifier is a different thing and gets its own hook.
-      //
-      // Runs after the (value, gradient) rebuild above and before Update, so
-      // the stopping rules see the point we actually keep.  If the modifier
-      // moved x, its cached value and gradient are stale and have to be
-      // recomputed -- hence the compare, which is far cheaper than the
-      // evaluation it usually avoids.
-      if constexpr (IsFunctionState<StateType>::value) {
-        if (step_modifier_) {
-          const typename FunctionType::VectorType x_before =
-              current_function_state.x;
-          step_modifier_(function, current_function_state);
-          if (current_function_state.x != x_before) {
-            current_function_state =
-                StateType(function, current_function_state.x);
-          }
-        }
-      }
+      ApplyStepModifier(function, current_function_state);
 
       solver_state.Update(function, previous_function_state,
                           current_function_state, stopping_progress);
@@ -297,6 +270,25 @@ class Solver {
   virtual StateType OptimizationStep(const FunctionType& function,
                                      const StateType& current,
                                      const ProgressType& state) = 0;
+
+ protected:
+  // Let a caller move the accepted iterate before it is judged -- what makes
+  // projected gradient possible when the feasible set is not the box the
+  // solver was given (ours is |rf| <= b1max, a disc).  Called after the
+  // (value, gradient) rebuild and before Update, so the stopping rules see
+  // the point actually kept; if x moved, its cached pair is stale.
+  // Subclasses that override Minimize() must call this themselves.
+  void ApplyStepModifier(const FunctionType& function, StateType& st) const {
+    if constexpr (IsFunctionState<StateType>::value) {
+      if (step_modifier_) {
+        const typename FunctionType::VectorType x_before = st.x;
+        step_modifier_(function, st);
+        if (st.x != x_before) st = StateType(function, st.x);
+      }
+    }
+  }
+
+ public:
 
   CallbackType step_callback_;  // A user-defined callback function.
   StepModifierType step_modifier_;  // optional; may move the iterate

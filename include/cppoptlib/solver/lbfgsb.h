@@ -275,6 +275,8 @@ class Lbfgsb
         current_function_state = StateType(function, current_function_state.x);
       }
 
+      this->ApplyStepModifier(function, current_function_state);
+
       solver_state.Update(function, previous_function_state,
                           current_function_state, this->stopping_progress);
       if ((projected_gradient_tolerance > 0) &&
