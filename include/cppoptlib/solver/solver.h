@@ -176,6 +176,14 @@ class Solver {
 
   void SetCallback(CallbackType callback) { step_callback_ = callback; }
 
+  // A hook that may *move* the accepted iterate, unlike `SetCallback`'s
+  // observer.  See where it is invoked in `Minimize` for why it exists.
+  using StepModifierType =
+      std::function<void(const FunctionType&, StateType&)>;
+  void SetStepModifier(StepModifierType modifier) {
+    step_modifier_ = modifier;
+  }
+
   virtual void InitializeSolver(const FunctionType& /*function*/,
                                 const StateType& /*initial_state*/) = 0;
 
@@ -249,6 +257,35 @@ class Solver {
         }
       }
 
+      // Let a caller move the accepted iterate before it is judged.  This is
+      // what makes a projected-gradient method possible when the feasible set
+      // is not the box the solver was given: our rf constraint is
+      // |rf| <= b1max, a disc, and the cartesian box's corner sits outside it
+      // at sqrt(2) b1max.  Folding the projection into the objective instead
+      // leaves the solver's own variables drifting on a plateau that maps to
+      // the same point, which converges far worse.
+      //
+      // Deliberately not `step_callback_`: that one is an observer (it takes
+      // the state by const reference, and PrintProgressCallback relies on
+      // that).  A modifier is a different thing and gets its own hook.
+      //
+      // Runs after the (value, gradient) rebuild above and before Update, so
+      // the stopping rules see the point we actually keep.  If the modifier
+      // moved x, its cached value and gradient are stale and have to be
+      // recomputed -- hence the compare, which is far cheaper than the
+      // evaluation it usually avoids.
+      if constexpr (IsFunctionState<StateType>::value) {
+        if (step_modifier_) {
+          const typename FunctionType::VectorType x_before =
+              current_function_state.x;
+          step_modifier_(function, current_function_state);
+          if (current_function_state.x != x_before) {
+            current_function_state =
+                StateType(function, current_function_state.x);
+          }
+        }
+      }
+
       solver_state.Update(function, previous_function_state,
                           current_function_state, stopping_progress);
     } while (solver_state.status == Status::Continue);
@@ -262,6 +299,7 @@ class Solver {
                                      const ProgressType& state) = 0;
 
   CallbackType step_callback_;  // A user-defined callback function.
+  StepModifierType step_modifier_;  // optional; may move the iterate
 };
 
 }  // namespace cppoptlib::solver
