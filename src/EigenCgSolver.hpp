@@ -25,7 +25,7 @@
 #define EIGENCGSOLVER_H_
 #include <string>
 #include <vector>
-#include "ISolver.hpp"
+#include "pcgcompat.hpp"
 namespace pwie
 {
 
@@ -46,32 +46,55 @@ namespace pwie
  * set from the sign of the gradient, CG on the free variables, and a
  * restartRule saying what an active-set change does to the direction.
  *
- * On the pulse problems in example/, ASA's two phases never interleave, and
- * the reason is worth knowing before reaching for it.  The undecided set
+ * On the pulse problems in example/, ASA's two phases never interleave.  The
+ * undecided set
  *
  *     U(x) = {i : |g_i| >= ||d^1(x)||^(1/2) and dist_i >= ||d^1(x)||^(3/2)}
  *
- * is written for the paper's model box l = 0, u = infinity, where the second
- * test reads x_i >= ||d^1||^(3/2) and x_i may be arbitrarily large.  Our box
- * is bounded on both sides, so dist_i -- the distance to the nearer bound --
- * is at most the width of that side, and the test cannot be satisfied at all
- * once ||d^1|| exceeds roughly that width.  Far from a stationary point it
- * never is: measured, U(x) is empty at every iterate of every run here.  Two
- * rescalings were tried and dropped again: nondimensionalizing the thresholds
- * by an rms box width made U(x) never empty instead, so it stayed in NGPA
- * forever and came out ~11% worse on bebop; a per-variable diagonal
- * preconditioner (the paper's P-ASA, section 6) left U(x) empty exactly as
- * before.  The obstruction is the two-sided box, not the units.
+ * is empty at every iterate of every run, so step 1a goes to the UA on
+ * iteration 1 and only step 2a, ||g_I|| < mu||d^1||, could come back.  Two
+ * reasons, both measured on bebop_pp45 --ctype ampangle:
  *
- * U empty is not a malfunction -- it is the paper's signal that the large
- * gradient components are identified and the unconstrained algorithm should
- * run -- but it means step 1a sends us to the UA immediately and only step
- * 2a, ||g_I|| < mu||d^1|| with mu = 0.1, can send us back.  Within the
- * iteration budgets used here that never happens either, so ASA reduces to
- * its UA on a face that only ever grows, and the NGPA -- the phase that would
- * pay off on an active set that churns -- runs once or twice and then never
- * again.  The verbose summary prints the ngpa/ua/Uempty counts, which is how
- * to check this on a new problem before concluding anything from a mode.
+ * - The gradient test cannot be met once ||d^1|| < 1.  For a free component
+ *   d^1_i = -g_i, so |g_i| <= ||d^1||, and ||d^1|| < ||d^1||^(1/2) there.
+ *   That is arithmetic, not a property of the problem: it holds from about
+ *   iteration 10 on.  The only components that do clear the threshold are the
+ *   fixed ones (ampangle pins 250 dt variables at lo == hi, |g| ~ 1e6), and
+ *   they have dist_i = 0, so they fail the second test.  The powers are the
+ *   paper's, written for a model box with x, f and g all order 1.
+ * - Step 2a cannot fire either.  d^1 and g_I differ only in the components
+ *   that sit on a bound with the gradient pointing back inward, and here
+ *   there are 1 to 6 of them out of ~490, contributing ~1e-5: measured
+ *   ||g_I||/||d^1|| stays within 0.5% of 1 for the whole run, against
+ *   mu = 0.1.
+ *
+ * So MODE_ASA is its UA on a face that only grows (250 active at the start,
+ * 493 of 750 at iteration 2000).  That is NOT why it trails asa_cg, and the
+ * obvious repair is a trap -- forcing the phases to alternate, by ignoring U
+ * and switching on the active set alone, makes it monotonically worse:
+ * ngpa = 499 gives 4.4 and ngpa = 651 gives 13.3, against 2.05 for the
+ * ngpa = 1 default and 13.5 for MODE_PCG.  The optimum here is bang-bang
+ * (asa_cg's own answer has 245 of 250 amplitudes hard against b1max, ours
+ * 240), so pinning a saturated variable is right and re-deciding it wastes
+ * the budget.  U(x) being empty is protecting this mode, not crippling it.
+ *
+ * What is left is that asa_cg reaches 0.96 where this reaches 2.05 at equal
+ * function count, with the same shape of answer.  Its UA is CG_DESCENT with
+ * an approximate Wolfe line search (~1.9 f and 1.05 g per iteration); ours is
+ * PRP+ over an Armijo arc that backtracks about twice per iteration (~2.9 f,
+ * 1.0 g).  Tried and measured worse, so not in the tree: beta_HZ (2.28),
+ * the vendored HZ search, which mostly refuses because the step leaves the
+ * box (2.70), a Wolfe curvature test on the arc (3.11 -- the existing
+ * doubling loop is a better crude line minimizer than sigma = 0.9), and
+ * three initial-step rules (no effect, the backtrack count barely moves).
+ * The remaining gap is line search quality inside the UA.
+ *
+ * Earlier and also dropped: nondimensionalizing the U thresholds by an rms
+ * box width made U never empty, so it stayed in NGPA forever, ~11% worse; a
+ * per-variable diagonal preconditioner (P-ASA, section 6) left U empty.
+ *
+ * The verbose summary prints ngpa/ua/Uempty and the f and g counts, which is
+ * how to check any of this on a new problem before concluding from a mode.
  *
  * This class exists at all because AsaCgSolver's iteration loop lives inside a
  * third-party C library with no per-iteration callback, so it cannot call
@@ -179,6 +202,14 @@ private:
   mutable size_t _ngpaIters = 0;
   mutable size_t _uaIters = 0;
   mutable size_t _uEmpty = 0;
+  //! work counters.  An HZ line search evaluates through HzFunction and so is
+  //! not counted here; SEARCH_ARC, the default, is.
+  mutable size_t _nf = 0;
+  mutable size_t _ng = 0;
+
+  Scalar fEval(const InputType & x) const { _nf++; return _functor.f(x); }
+  void gEval(const InputType & x, JacobianType & g) const
+  { _ng++; _functor.gradient(x, g); }
 
 public:
   EigenCgSolver(const Func & func);

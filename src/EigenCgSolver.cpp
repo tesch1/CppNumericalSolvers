@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 #include "stopwatch.hpp"
-#include "hager_zhang.h"
+#include "cppoptlib/linesearch/hager_zhang.h"
 
 namespace pwie
 {
@@ -209,7 +209,7 @@ EigenCgSolver<Func>::lineSearch(const InputType & x, const JacobianType & g,
     clampToBox(xnew);
     gda = g.dot(xnew - x);
     if (gda < 0) {
-      fa = _functor.f(xnew);
+      fa = fEval(xnew);
       if (std::isfinite(fa) && fa <= fref + (Scalar)_c1 * gda)
         break;
     }
@@ -250,7 +250,7 @@ EigenCgSolver<Func>::lineSearch(const InputType & x, const JacobianType & g,
       const Scalar gd2 = g.dot(xtry - x);
       if (!(gd2 < 0))
         break;
-      const Scalar f2 = _functor.f(xtry);
+      const Scalar f2 = fEval(xtry);
       if (!(std::isfinite(f2) && f2 < fa && f2 <= fref + (Scalar)_c1 * gd2))
         break;
       a = a2;
@@ -281,10 +281,10 @@ EigenCgSolver<Func>::internalSolve(InputType & x0)
 
   InputType x = x0;
   clampToBox(x);              // the seed itself may be outside the box
-  ISolver<Func>::postStep(x);
+  this->postStep(x);
   clampToBox(x);
 
-  _ngpaIters = _uaIters = _uEmpty = 0;
+  _ngpaIters = _uaIters = _uEmpty = _nf = _ng = 0;
   settings.numIters = 0;
 
   if (mode == MODE_PCG)
@@ -310,8 +310,8 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   MaskType free(DIM), free_old(DIM);
   std::vector<Scalar> fhist;      // for the nonmonotone reference, if asked
 
-  Scalar f = _functor.f(x);
-  _functor.gradient(x, g);
+  Scalar f = fEval(x);
+  gEval(x, g);
   freeSet(x, g, free);
   free_old = free;
 
@@ -437,13 +437,13 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
     const InputType xprev = x;
     x = xnew;
     f = f_try;
-    ISolver<Func>::postStep(x);
+    this->postStep(x);
     clampToBox(x);
     /* postStep may have moved x off the point the line search evaluated (only
      * when the functor has a projection), so f -- and any gradient the search
      * handed back -- have to be discarded and re-measured there. */
     if (x != xnew) {
-      f = _functor.f(x);
+      f = fEval(x);
       haveGrad = false;
     }
     s = x - xprev;            // the step actually taken, for the BB length
@@ -455,7 +455,7 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
     }
     else {
       const JacobianType g_old = g;
-      _functor.gradient(x, g);
+      gEval(x, g);
       sy = s.dot(g - g_old);
     }
     ss = s.squaredNorm();
@@ -490,7 +490,7 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
       stall = 0;
 
     InputType dir = alpha * d;
-    if (ISolver<Func>::checkConverged(iter, x, alpha, dir, g)) {
+    if (this->checkConverged(iter, x, alpha, dir, g)) {
       why = "functor says converged";
       break;
     }
@@ -511,7 +511,8 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
 
   if (settings.verbosity > 0)
     std::cout << "eigencg[simple]: stopped after " << settings.numIters
-              << " iterations, f=" << fbest << ": " << why << "\n";
+              << " iterations, f=" << fbest << ": " << why
+              << " (nf=" << _nf << " ng=" << _ng << ")\n";
 }
 
 /*! \brief The Hager-Zhang active set algorithm, ASA.
@@ -544,23 +545,10 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   const Scalar Ualpha = 0.5, Ubeta = 1.5;
   Scalar mu = 0.1;
 
-  /* A caveat on U(x), because it decides everything below.  Its two tests,
-   * |g_i| >= ||d^1||^alpha and dist_i >= ||d^1||^beta, are not dimensionally
-   * consistent: with x in units X and f in units F they compare F/X against
-   * X^(1/2), and X against X^(3/2).  They therefore only mean what the paper
-   * intends on a problem scaled so x, f and g are all order 1.  Ours is not --
-   * rf lives at 1e5 rad/s and dQ/dx at 1e-9 -- and our box is two-sided, so
-   * dist_i is capped by the box width while ||d^1||^(3/2) is not.  Measured,
-   * U(x) is empty at every iterate of every run, which sends ASA into the UA
-   * on iteration 1 (ngpa=1, ua=199) and never lets it back out: the NGPA phase
-   * never runs and this reduces to CG on a growing face.
-   *
-   * Two rescalings were tried and neither fixed it, so neither survives here:
-   * nondimensionalizing x by an rms box width made U(x) never empty instead
-   * (so it stayed in NGPA forever, ~11% worse on bebop), and a per-variable
-   * diagonal preconditioner S_i = box width -- the paper's P-ASA of section 6
-   * -- left U(x) empty exactly as before.  The obstruction is the two-sided
-   * box, not the units. */
+  /* U(x) decides everything below and is empty at every iterate here, so ASA
+   * runs as its UA alone.  The class comment says why, and why that is not the
+   * reason this trails asa_cg -- forcing the phases to alternate is measurably
+   * worse.  Do not "fix" the switching rule without re-reading it. */
 
   // d^alpha and the norms
   auto projDirS = [&](const InputType & xx, const JacobianType & gg,
@@ -576,8 +564,8 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   MaskType atBound(DIM), atBound_prev(DIM), freeMask(DIM);
   std::vector<Scalar> fhist;
 
-  Scalar f = _functor.f(x);
-  _functor.gradient(x, g);
+  Scalar f = fEval(x);
+  gEval(x, g);
   fhist.push_back(f);
   Scalar fbest = f;
   xbest = x;
@@ -593,6 +581,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   abar = MIN(alphaMax, MAX(alphaMin, abar));
   int jcbb = 0;
   bool flag = true;
+  bool firstNgpa = true;
   Scalar fr = f, fr_prev = f, fmin = f, fmaxmin = f;
   int acount = 0, lcount = 0;
 
@@ -605,6 +594,21 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   int stall = 0;
   Stopwatch<> stopwatch;
   const char * why = "iteration limit";
+
+  /* "Restarting the NGPA" means x0 is the current iterate, so I0 and R0 run
+   * again: fresh stepsize and cycle, and a reference value that has forgotten
+   * the UA's iterates. */
+  auto restartNgpa = [&]() {
+    projDirS(x, g, 1, d1);
+    abar = 1 / MAX(normS(d1), std::numeric_limits<Scalar>::min());
+    abar = MIN(alphaMax, MAX(alphaMin, abar));
+    jcbb = 0;
+    flag = true;
+    firstNgpa = true;
+    fr = fr_prev = fmin = fmaxmin = f;
+    acount = lcount = 0;
+    fhist.assign(1, f);
+  };
 
   while (iter < settings.maxIter) {
 
@@ -627,6 +631,12 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
 
     if (!inUA) {
       /* ---- NGPA, one iteration (section 2, steps 1-5) ---- */
+      // I0: flag starts set at k = 0 only; every later iteration clears it, and
+      // I1/I3 below set it again.  Without this reset flag stays set forever,
+      // I4 fires every iteration, and the cycle in cyclic BB never happens.
+      if (!firstNgpa)
+        flag = false;
+      firstNgpa = false;
       bool truncated = false;
       {
         // step 1: d_k = P(x_k - abar_k g_k) - x_k
@@ -668,7 +678,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       while (true) {
         xnew = x + alpha * d;
         clampToBox(xnew);       // x + alpha*d is already feasible for alpha<=1
-        ftry = _functor.f(xnew);
+        ftry = fEval(xnew);
         if (std::isfinite(ftry) && ftry <= fR + delta * alpha * gd)
           break;
         if (++nb > _maxBacktrack)
@@ -686,11 +696,11 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       const JacobianType gprev = g;
       x = xnew;
       f = ftry;
-      ISolver<Func>::postStep(x);
+      this->postStep(x);
       clampToBox(x);
       if (x != xnew)
-        f = _functor.f(x);
-      _functor.gradient(x, g);
+        f = fEval(x);
+      gEval(x, g);
       s = x - xprev;
       yv = g - gprev;
 
@@ -733,6 +743,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
         // nothing free to move: hand back to the NGPA, which can leave a face
         inUA = false;
         uaRestart = true;
+        restartNgpa();
         continue;
       }
 
@@ -790,6 +801,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
         // the face is as good as we can make it: let the NGPA move the set
         inUA = false;
         uaRestart = true;
+        restartNgpa();
         continue;
       }
       alphaLS = step;
@@ -797,17 +809,17 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       const InputType xprev = x;
       x = xnew;
       f = ftry;
-      ISolver<Func>::postStep(x);
+      this->postStep(x);
       clampToBox(x);
       if (x != xnew) {
-        f = _functor.f(x);
+        f = fEval(x);
         haveGrad = false;
       }
       pg_old = pg;
       if (haveGrad)
         g = gnew;
       else
-        _functor.gradient(x, g);
+        gEval(x, g);
       s = x - xprev;
       uaAlpha = step;
       uaGdOld = gd;
@@ -888,6 +900,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       if (gInrm < mu * d1nrm) {
         inUA = false;         // subproblem solved: back to the NGPA
         uaRestart = true;
+        restartNgpa();
       }
       else if (nActivePrev < nActive) {
         if (Uempty || nActive > nActivePrev + n2)
@@ -895,6 +908,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
         else {
           inUA = false;
           uaRestart = true;
+          restartNgpa();
         }
       }
     }
@@ -910,7 +924,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       stall = 0;
 
     InputType dir = alphaLS * (inUA ? dcg : d);
-    if (ISolver<Func>::checkConverged(iter, x, alphaLS, dir, g)) {
+    if (this->checkConverged(iter, x, alphaLS, dir, g)) {
       why = "functor says converged";
       break;
     }
@@ -936,7 +950,8 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
     std::cout << "eigencg[asa]: stopped after " << settings.numIters
               << " iterations, f=" << fbest << ": " << why
               << " (ngpa=" << _ngpaIters << " ua=" << _uaIters
-              << " Uempty=" << _uEmpty << ")\n";
+              << " Uempty=" << _uEmpty
+              << " nf=" << _nf << " ng=" << _ng << ")\n";
 }
 
 }
