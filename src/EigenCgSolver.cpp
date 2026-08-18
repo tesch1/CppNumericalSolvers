@@ -547,6 +547,7 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   if (fbest < f)
     x = xbest;                // a nonmonotone search can end above its best
 
+  settings.stopReason = why;
   if (settings.verbosity > 0)
     std::cout << "eigencg[simple]: stopped after " << settings.numIters
               << " iterations, f=" << fbest << ": " << why
@@ -984,6 +985,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   if (fbest < f)
     x = xbest;                // the NGPA is nonmonotone by design
 
+  settings.stopReason = why;
   if (settings.verbosity > 0)
     std::cout << "eigencg[asa]: stopped after " << settings.numIters
               << " iterations, f=" << fbest << ": " << why
