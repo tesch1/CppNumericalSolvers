@@ -236,11 +236,27 @@ EigenCgSolver<Func>::lineSearch(const InputType & x, const JacobianType & g,
       return false;           // step has underflowed to nothing
   }
 
-  /* Only grow the step when the first guess was accepted outright: that is the
-   * case where the guess may have been far too small, and it is what lets the
-   * search find its own scale on iteration 0 without a tuned initial step. */
+  /* The first guess passing Armijo does not make it good, so when it is
+   * accepted outright probe both ways: double while f keeps falling, and if
+   * doubling never helped, halve while it keeps falling.  Either way the step
+   * lands within a factor of two of the best on the ray whatever scale the
+   * guess had, which is what the guess alone cannot supply -- 2|f|/|g.d| asks
+   * for a decrease of 2f, an overshoot by f/f* on a cost bounded below at 0.
+   *
+   * Growing alone used to be enough to accept a step ~4x past the ray minimum
+   * on iteration 0.  Under ampangle that is fatal rather than merely slow:
+   * |rf| is exp(x), so an amplitude the overlong step slams onto its floor has
+   * a gradient of exp(floor) in both its own coordinate and its phase, and
+   * never comes back.  35 of 250 died in the first four iterations and the run
+   * converged to 8.52 against asa_cg's 0.808; probing both ways kills none.
+   *
+   * Only when the box is the whole feasible set.  With a postStep projection
+   * (--rescale) the point the search evaluated is not the point taken, so the
+   * minimum along the box arc is the wrong target: shrinking to it picks
+   * interior points where the answer wants the disc boundary (0.82 -> 4.37). */
   if (nback == 0) {
     InputType xtry(x.rows());
+    int grew = 0;
     for (int i = 0; i < _maxExpand; i++) {
       const Scalar a2 = 2 * a;
       xtry = x + a2 * d;
@@ -257,6 +273,24 @@ EigenCgSolver<Func>::lineSearch(const InputType & x, const JacobianType & g,
       fa = f2;
       gda = gd2;
       xnew = xtry;
+      grew++;
+    }
+    if (!grew && !this->_post) {
+      for (int i = 0; i < _maxExpand; i++) {
+        const Scalar a2 = a / 2;
+        xtry = x + a2 * d;
+        clampToBox(xtry);
+        const Scalar gd2 = g.dot(xtry - x);
+        if (!(gd2 < 0))
+          break;
+        const Scalar f2 = fEval(xtry);
+        if (!(std::isfinite(f2) && f2 < fa && f2 <= fref + (Scalar)_c1 * gd2))
+          break;
+        a = a2;
+        fa = f2;
+        gda = gd2;
+        xnew = xtry;
+      }
     }
   }
 
@@ -337,7 +371,7 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
       why = "projected gradient below gradTol";
       break;
     }
-    if (f <= settings.objectiveLimit) {
+    if (f <= objectiveLimit()) {
       why = "objective below objectiveLimit";
       break;
     }
@@ -501,7 +535,11 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
                 << " dt=" << stopwatch.elapsed()/1e3
                 << " df=" << (f_old - f)
                 << " step=" << alpha
-                << " nfree=" << free.count() << std::endl;
+                << " nfree=" << free.count()
+                // ||pg|| separates a bad direction from a flat face when the
+                // cost stops moving; nothing else in the line tells them apart
+                << " pg=" << pg.norm()
+                << std::endl;
       stopwatch.start();
     }
   }
@@ -620,7 +658,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       break;
     }
     projDirS(x, g, 1, d1);    // the algorithm's own d^1, in scaled units
-    if (f <= settings.objectiveLimit) {
+    if (f <= objectiveLimit()) {
       why = "objective below objectiveLimit";
       break;
     }

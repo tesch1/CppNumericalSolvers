@@ -89,6 +89,14 @@ namespace pwie
  * three initial-step rules (no effect, the backtrack count barely moves).
  * The remaining gap is line search quality inside the UA.
  *
+ * Some of it has since been closed: lineSearch() now probes shorter steps as
+ * well as longer ones.  On bebop_pp45 --ctype ampangle that alone takes
+ * MODE_ASA from 1.267 to 0.80773 and MODE_PCG from 8.518 to 0.80773, both
+ * stopping on gradTol, against asa_cg's 0.8078 and ipopt's 0.8076.  It is also
+ * why the three initial-step rules measured as no effect -- the accepted step
+ * barely depends on the guess once the search can move either way.  See the
+ * comment there.
+ *
  * Earlier and also dropped: nondimensionalizing the U thresholds by an rms
  * box width made U never empty, so it stayed in NGPA forever, ~11% worse; a
  * per-variable diagonal preconditioner (P-ASA, section 6) left U empty.
@@ -217,6 +225,18 @@ public:
   void internalSolve(InputType & x0);
 
 private:
+  /*! Options spells "no objective limit" as -infinity, and this tree builds
+   * with -ffast-math, which folds that constant to a *positive* denormal.  An
+   * untouched limit therefore reads as zero and stops any problem whose cost
+   * goes negative on the first iteration -- bebop_skinner2003 and
+   * sburbop_ur180 both did.  Nothing sets a target that tiny on purpose.
+   * (The clean fix is a finite default in pcgcompat.hpp's Options.)
+   */
+  inline Scalar objectiveLimit() const {
+    const double lim = settings.objectiveLimit;
+    return (lim > 0 && lim < 1e-300) ? -std::numeric_limits<Scalar>::max()
+                                     : (Scalar)lim;
+  }
   //! x <- P(x), the projection onto the box.  Cheap insurance: every iterate
   //! this solver hands back has been through here.
   inline void clampToBox(InputType & x) const {
