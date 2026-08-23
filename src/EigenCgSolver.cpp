@@ -299,6 +299,43 @@ EigenCgSolver<Func>::lineSearch(const InputType & x, const JacobianType & g,
   return true;
 }
 
+/*! \brief The f-delta safety net: has the run stopped moving at all?
+ *
+ * Both modes stop on the projected gradient, which is what asa_cg stops on;
+ * this is only a net against a run that is genuinely stuck, and it is meant to
+ * be hard to trip.  Two things make it so:
+ *
+ * - It asks for progress over a long window of iterations, not from one
+ *   iteration to the next.  A CG makes several negligible steps in a row while
+ *   it turns a corner, and it was five of those that ended every asa_cg2 run:
+ *   18 of 18 measured runs stopped here and none on the gradient, which is how
+ *   bibop_kobzar2004 ampangle finished at -0.9802 against asa_cg's -0.9968.
+ *   The window has to be long because these problems crawl legitimately: at a
+ *   window of 20, bibop still quit at -0.9564 where the same run left to
+ *   itself reached -0.9968.  A run that is really dead is caught by the
+ *   null-step test in the line search instead, and much sooner.
+ * - It measures the improvement relative to |f|, for the same reason --gtol is
+ *   a fraction of the projected gradient at x0 (ac35342): a tolerance in the
+ *   objective's own units silently changes meaning whenever the objective or
+ *   the variables are rescaled.
+ *
+ * settings.tol is the fraction, from --ftol.  Returns true, once per window,
+ * when the window improved the best value by less than tol*|f|.
+ */
+template <typename Func>
+bool
+EigenCgSolver<Func>::stalled(Scalar fbest, Scalar & fwin, int & left) const
+{
+  if (--left > 0)
+    return false;
+  left = _stallWindow;
+  // |f| == 0 is as good as converged, and has no scale to be relative to
+  const Scalar scale = std::abs(fwin) > 0 ? std::abs(fwin) : (Scalar)1;
+  const bool stuck = !(fwin - fbest > settings.tol * scale);
+  fwin = fbest;
+  return stuck;
+}
+
 template <typename Func>
 void
 EigenCgSolver<Func>::internalSolve(InputType & x0)
@@ -355,7 +392,8 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   Scalar gd_old = 0;
   Scalar sy = 0, ss = 0;      // for the BB step
   bool restart = true;
-  int stall = 0;
+  Scalar fwin = f;            // f-delta window state, see stalled()
+  int stallLeft = _stallWindow;
   size_t iter = 0;
   Stopwatch<> stopwatch;
 
@@ -455,10 +493,17 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
      * arc: the CG's conjugacy assumes a Wolfe point, but only the arc can
      * cross a face, and on these problems most of the rf saturates. */
     bool haveGrad = false;
+    bool searched = true;
     if (searchRule == SEARCH_HZ &&
         lineSearchHz(x, g, d, step, f_try, xnew, gnew))
       haveGrad = true;
-    else if (!lineSearch(x, g, d, step, f_try, fref, xnew)) {
+    else
+      searched = lineSearch(x, g, d, step, f_try, fref, xnew);
+    // a step that moves neither x nor f is not progress, whatever the search
+    // says; see the same test in the UA
+    if (searched && (xnew == x || !(f_try < fref)))
+      searched = false;
+    if (!searched) {
       if (!restart) {
         // a stale CG direction is the usual culprit; retry from -pg
         restart = true;
@@ -512,16 +557,13 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
       xbest = x;
     }
 
-    // stall is measured against the best seen, so a nonmonotone search that
-    // is genuinely exploring does not look like a stall
-    if (!(f_old - f > settings.tol) && !(f < fbest + settings.tol)) {
-      if (++stall > _maxStall) {
-        why = "no improvement above tol";
-        break;
-      }
+    // the safety net; the stop that matters is the gradient test above.  It
+    // is measured on the best value seen, so a nonmonotone search that is
+    // genuinely exploring does not look stuck.
+    if (stalled(fbest, fwin, stallLeft)) {
+      why = "no improvement above tol";
+      break;
     }
-    else
-      stall = 0;
 
     InputType dir = alpha * d;
     if (this->checkConverged(iter, x, alpha, dir, g)) {
@@ -630,7 +672,8 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   Scalar uaAlpha = 0, uaGdOld = 0;
 
   size_t iter = 0;
-  int stall = 0;
+  Scalar fwin = f;            // f-delta window state, see stalled()
+  int stallLeft = _stallWindow;
   Stopwatch<> stopwatch;
   const char * why = "iteration limit";
 
@@ -654,7 +697,8 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
     /* Stop on the unpreconditioned KKT measure whatever the mode, so every
      * mode and asa_cg stop on the same quantity. */
     projDir(x, g, 1, d1);
-    if (d1.template lpNorm<Eigen::Infinity>() <= settings.gradTol) {
+    const Scalar pgInf = d1.template lpNorm<Eigen::Infinity>();
+    if (pgInf <= settings.gradTol) {
       why = "projected gradient below gradTol";
       break;
     }
@@ -829,10 +873,24 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
        * arc, which is a documented deviation from the paper. */
       Scalar ftry = f;
       bool haveGrad = false;
+      bool searched = true;
       if (searchRule == SEARCH_HZ &&
           lineSearchHz(x, g, dcg, step, ftry, xnew, gnew))
         haveGrad = true;
-      else if (!lineSearch(x, g, dcg, step, ftry, f, xnew)) {
+      else
+        searched = lineSearch(x, g, dcg, step, ftry, f, xnew);
+      /* A search that reports success with a step so short that neither x nor
+       * f moves is not progress, and has to be caught here: it leaves the
+       * search happy and the iterate exactly where it was, so the UA spins on
+       * the same face forever taking null steps.  That is what burbop_ur90
+       * seed 1 did from iteration 1084 -- df exactly 0 and ||d^1||_inf frozen
+       * at 3.8e-4, 7 orders above gradTol -- until the f-delta net ended it
+       * 3.5e-3 short of asa_cg.  A face the UA cannot improve is the paper's
+       * signal to hand back to the NGPA, which is the phase allowed to leave
+       * it. */
+      if (searched && (xnew == x || !(ftry < f)))
+        searched = false;
+      if (!searched) {
         if (!uaRestart) {
           uaRestart = true;   // stale direction; retry from -pg
           continue;
@@ -953,14 +1011,11 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
     }
     nActivePrev = nActive;
 
-    if (!(fbest < f_old - settings.tol)) {
-      if (++stall > _maxStall) {
-        why = "no improvement above tol";
-        break;
-      }
+    // the safety net; the stop that matters is the gradient test above
+    if (stalled(fbest, fwin, stallLeft)) {
+      why = "no improvement above tol";
+      break;
     }
-    else
-      stall = 0;
 
     InputType dir = alphaLS * (inUA ? dcg : d);
     if (this->checkConverged(iter, x, alphaLS, dir, g)) {
@@ -976,6 +1031,9 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
                 << " step=" << alphaLS
                 << " phase=" << (inUA ? "UA" : "NGPA")
                 << " nact=" << nActive
+                // the quantity the run stops on, so a crawling cost can be
+                // told from one that is simply finished
+                << " pg=" << pgInf
                 << " abar=" << abar
                 << " U=" << (Uempty ? "0" : "1") << std::endl;
       stopwatch.start();

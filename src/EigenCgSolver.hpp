@@ -104,6 +104,13 @@ namespace pwie
  * The verbose summary prints ngpa/ua/Uempty and the f and g counts, which is
  * how to check any of this on a new problem before concluding from a mode.
  *
+ * Both modes stop on the projected gradient, ||P(x - g) - x||_inf <= gradTol,
+ * which is the quantity asa_cg stops on.  The f-delta test is only a safety
+ * net over a long window -- see stalled() for why it has to be, and for what
+ * it used to cost.  A run that is really dead shows up as a step that moves
+ * neither x nor f, and the line search callers treat that as a failure rather
+ * than accepting it: in the UA it hands the face back to the NGPA.
+ *
  * This class exists at all because AsaCgSolver's iteration loop lives inside a
  * third-party C library with no per-iteration callback, so it cannot call
  * ISolver::postStep().  A parameterization whose feasible set is not a box
@@ -203,8 +210,8 @@ private:
   static constexpr int _maxBacktrack = 50;
   //! how far one line search may grow the trial step (2^_maxExpand).
   static constexpr int _maxExpand = 12;
-  //! consecutive non-improving iterations tolerated before declaring done.
-  static constexpr int _maxStall = 5;
+  //! how many iterations the f-delta safety net measures progress over.
+  static constexpr int _stallWindow = 200;
 
   //! counters, for the verbose summary: which phase spent the iterations
   mutable size_t _ngpaIters = 0;
@@ -266,6 +273,9 @@ private:
   bool lineSearchHz(const InputType & x, const JacobianType & g, const InputType & d,
                     Scalar & alpha, Scalar & fval, InputType & xnew,
                     JacobianType & gnew) const;
+  //! f-delta safety net, called once per accepted iteration.  fwin and left
+  //! are the caller's window state, started at (f0, _stallWindow).
+  bool stalled(Scalar fbest, Scalar & fwin, int & left) const;
   //! the two solvers
   void solveSimple(InputType & x);
   void solveAsa(InputType & x);
