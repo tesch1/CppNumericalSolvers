@@ -398,12 +398,13 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   Stopwatch<> stopwatch;
 
   const char * why = "iteration limit";
+  Scalar pgnorm = 0;
 
   while (iter < settings.maxIter) {
 
     /* KKT measure, ||P(x - g) - x||_inf -- the same quantity asa_cg tests
      * grad_tol against, so the two solvers stop on the same footing */
-    const Scalar pgnorm =
+    pgnorm =
       ((x - g).cwiseMax(_lb).cwiseMin(_ub) - x).template lpNorm<Eigen::Infinity>();
     if (pgnorm <= settings.gradTol) {
       why = "projected gradient below gradTol";
@@ -593,7 +594,11 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   if (settings.verbosity > 0)
     std::cout << "eigencg[simple]: stopped after " << settings.numIters
               << " iterations, f=" << fbest << ": " << why
-              << " (nf=" << _nf << " ng=" << _ng << ")\n";
+              // the quantity the run wanted to stop on, against the tolerance
+              // it wanted to beat: the only way to tell a converged run from
+              // one the budget or the f-delta net cut off mid-descent
+              << " (pg=" << pgnorm << " gradTol=" << settings.gradTol
+              << " nf=" << _nf << " ng=" << _ng << ")\n";
 }
 
 /*! \brief The Hager-Zhang active set algorithm, ASA.
@@ -676,6 +681,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   int stallLeft = _stallWindow;
   Stopwatch<> stopwatch;
   const char * why = "iteration limit";
+  Scalar pgInf = 0;
 
   /* "Restarting the NGPA" means x0 is the current iterate, so I0 and R0 run
    * again: fresh stepsize and cycle, and a reference value that has forgotten
@@ -697,7 +703,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
     /* Stop on the unpreconditioned KKT measure whatever the mode, so every
      * mode and asa_cg stop on the same quantity. */
     projDir(x, g, 1, d1);
-    const Scalar pgInf = d1.template lpNorm<Eigen::Infinity>();
+    pgInf = d1.template lpNorm<Eigen::Infinity>();
     if (pgInf <= settings.gradTol) {
       why = "projected gradient below gradTol";
       break;
@@ -1047,7 +1053,9 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   if (settings.verbosity > 0)
     std::cout << "eigencg[asa]: stopped after " << settings.numIters
               << " iterations, f=" << fbest << ": " << why
-              << " (ngpa=" << _ngpaIters << " ua=" << _uaIters
+              // see the note in solveSimple's summary
+              << " (pg=" << pgInf << " gradTol=" << settings.gradTol
+              << " ngpa=" << _ngpaIters << " ua=" << _uaIters
               << " Uempty=" << _uEmpty
               << " nf=" << _nf << " ng=" << _ng << ")\n";
 }

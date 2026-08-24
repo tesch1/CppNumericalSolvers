@@ -68,26 +68,68 @@ namespace pwie
  *   ||g_I||/||d^1|| stays within 0.5% of 1 for the whole run, against
  *   mu = 0.1.
  *
- * So MODE_ASA is its UA on a face that only grows (250 active at the start,
- * 493 of 750 at iteration 2000).  That is NOT why it trails asa_cg, and the
- * obvious repair is a trap -- forcing the phases to alternate, by ignoring U
- * and switching on the active set alone, makes it monotonically worse:
- * ngpa = 499 gives 4.4 and ngpa = 651 gives 13.3, against 2.05 for the
- * ngpa = 1 default and 13.5 for MODE_PCG.  The optimum here is bang-bang
- * (asa_cg's own answer has 245 of 250 amplitudes hard against b1max, ours
- * 240), so pinning a saturated variable is right and re-deciding it wastes
- * the budget.  U(x) being empty is protecting this mode, not crippling it.
+ * So MODE_ASA is its UA on a face that only grows, and that is what the
+ * paper expects near a solution: Theorem 5.7 says that once the iterates
+ * approach a stationary point satisfying the strong second-order condition,
+ * "the ASA performs only the UA without restarts", and section 3 says U "is
+ * almost always empty when we reach a neighborhood of a minimizer".  What is
+ * wrong here is only that U is empty from iteration 1 rather than eventually,
+ * for the units reason above.
  *
- * What is left is that asa_cg reaches 0.96 where this reaches 2.05 at equal
- * function count, with the same shape of answer.  Its UA is CG_DESCENT with
- * an approximate Wolfe line search (~1.9 f and 1.05 g per iteration); ours is
- * PRP+ over an Armijo arc that backtracks about twice per iteration (~2.9 f,
- * 1.0 g).  Tried and measured worse, so not in the tree: beta_HZ (2.28),
- * the vendored HZ search, which mostly refuses because the step leaves the
- * box (2.70), a Wolfe curvature test on the arc (3.11 -- the existing
- * doubling loop is a better crude line minimizer than sigma = 0.9), and
- * three initial-step rules (no effect, the backtrack count barely moves).
- * The remaining gap is line search quality inside the UA.
+ * Two things this mode was accused of, and neither survived measurement.
+ *
+ * The first was that it converges to a worse point than asa_cg on
+ * bibop_kobzar2004 --ctype ampangle: -0.991001 against -0.996850, medians of
+ * three seeds.  Three seeds is not enough on that example.  Its own NOTES
+ * say so -- two runs from the same start gave 0.9877 and 0.9704 -- and over
+ * ten seeds the two solvers are the same result:
+ *
+ *   solver     median      mean       worst      n <= -0.9955
+ *   asa_cg     -0.996840  -0.995161  -0.990524      7 of 10
+ *   MODE_ASA   -0.996722  -0.994679  -0.980657      7 of 10
+ *
+ * The medians differ by 1.2e-4, well inside the 1e-3 this tree calls the
+ * same result, and asa_cg draws -0.9905, -0.9914 and -0.9918 on three of
+ * those ten seeds -- so -0.991 is not a place only this solver goes.  Both
+ * distributions are heavy-tailed because the example's 25000-iteration
+ * budget is short of what either solver needs; MODE_ASA left to run reaches
+ * -0.996850 at 54392 iterations, which is asa_cg's answer to every digit.
+ *
+ * Tried on the strength of the three-seed number and then dropped: handing
+ * the face back to the NGPA every N UA iterations, which is the only way
+ * back once U is empty, since neither step 2a nor step 2b can fire.  It does
+ * compress the tail (worst -0.9807 -> -0.9952, 9 of 10 seeds under -0.9955)
+ * but it moves the median 3.3e-4 the wrong way and costs iterations on
+ * iceberg ampangle, so it buys nothing the 1e-3 rule can see and it is a
+ * deviation from Figure 3.1.  N = 800 was the best of 200/400/800/1600.  The
+ * earlier attempt in the same direction -- ignoring U and switching on the
+ * active set alone, 4.4 and 13.3 against 2.05 on bebop_pp45 ampangle -- was
+ * a different rule and predates the lineSearch() fix below.
+ *
+ * The second accusation was the line search, and that was this comment's own
+ * guess for a while.  It is wrong.  Measured on iceberg cartesian, which is
+ * the clean case because both solvers reach the same minimizer so nothing
+ * else confounds it: they agree on the cost to 1.1e-9 and on the active set
+ * exactly -- the same 91 of 156 variables at a bound -- and asa_cg puts
+ * ||P(x-g)-x||_inf under gradTol in 2080 iterations where this needs 19103.
+ * Of the 19044 UA steps, 19030 satisfy the Wolfe curvature condition at
+ * sigma = 0.9, and |g_new.s| / |g.s| is under 0.01 on 5566 of them, under
+ * 0.1 on 3839 more and under 0.5 on 9587 more; 52 are worse than 0.5.  That
+ * is an accurate line minimizer, not a bad one.
+ *
+ * Nor is it the conjugacy formula -- BETA_HZ, which is CG_DESCENT's beta_N,
+ * with no restart at all, needs 16823, which is 12% and not the factor of 9
+ * -- nor a periodic CG restart (18148 at a period of 66), nor the active
+ * set: the frozen components carry almost none of the KKT residual, so the
+ * NGPA has nothing to free there, and forcing it in costs iterations (21397
+ * at a hand-back period of 50).  What remains is the asymptotic rate of this
+ * CG against CG_DESCENT's on a very ill-conditioned face, and closing that
+ * means writing CG_DESCENT, which is the code this class exists in order not
+ * to read.  So iceberg cartesian is ~5x asa_cg's wall time, stopping on the
+ * f-delta net at ~14000 iterations rather than on the gradient at ~19100 --
+ * but the pulse it hands back is asa_cg's, and it has been asa_cg's since
+ * about iteration 2000.  That is a known and unfixed cost, not a wrong
+ * answer.
  *
  * Some of it has since been closed: lineSearch() now probes shorter steps as
  * well as longer ones.  On bebop_pp45 --ctype ampangle that alone takes
@@ -103,6 +145,11 @@ namespace pwie
  *
  * The verbose summary prints ngpa/ua/Uempty and the f and g counts, which is
  * how to check any of this on a new problem before concluding from a mode.
+ * It also prints the final pg against gradTol, which is the one line that
+ * separates a run that converged from one the budget or the f-delta net cut
+ * off mid-descent.  Both accusations above would have looked different with
+ * that number in hand: bibop stops on the iteration limit with pg four
+ * orders above gradTol, so it had not converged to anything.
  *
  * Both modes stop on the projected gradient, ||P(x - g) - x||_inf <= gradTol,
  * which is the quantity asa_cg stops on.  The f-delta test is only a safety
