@@ -272,6 +272,16 @@ private:
   Scalar fEval(const InputType & x) const { _nf++; return _functor.f(x); }
   void gEval(const InputType & x, JacobianType & g) const
   { _ng++; _functor.gradient(x, g); }
+  /*! \brief  value and gradient at the same x, in one sweep.
+   *
+   * For the places this solver wants both at a point it has just moved to.
+   * The functor shares the spin-ensemble propagation between them, so this
+   * costs about what gEval alone costs; the value it returns is bit-identical
+   * to fEval(x) at the same x, so nothing downstream can tell the difference
+   * except the clock.
+   */
+  Scalar fgEval(const InputType & x, JacobianType & g) const
+  { _nf++; _ng++; return _functor.valgrad(x, g); }
 
 public:
   EigenCgSolver(const Func & func);

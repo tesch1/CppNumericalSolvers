@@ -381,8 +381,7 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
   MaskType free(DIM), free_old(DIM);
   std::vector<Scalar> fhist;      // for the nonmonotone reference, if asked
 
-  Scalar f = fEval(x);
-  gEval(x, g);
+  Scalar f = fgEval(x, g);
   freeSet(x, g, free);
   free_old = free;
 
@@ -521,11 +520,11 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
     clampToBox(x);
     /* postStep may have moved x off the point the line search evaluated (only
      * when the functor has a projection), so f -- and any gradient the search
-     * handed back -- have to be discarded and re-measured there. */
-    if (x != xnew) {
-      f = fEval(x);
+     * handed back -- have to be discarded and re-measured there.  Both at
+     * once: that is one ensemble sweep rather than two. */
+    const bool moved = (x != xnew);
+    if (moved)
       haveGrad = false;
-    }
     s = x - xprev;            // the step actually taken, for the BB length
 
     pg_old = pg;
@@ -535,7 +534,10 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
     }
     else {
       const JacobianType g_old = g;
-      gEval(x, g);
+      if (moved)
+        f = fgEval(x, g);
+      else
+        gEval(x, g);
       sy = s.dot(g - g_old);
     }
     ss = s.squaredNorm();
@@ -650,8 +652,7 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
   MaskType atBound(DIM), atBound_prev(DIM), freeMask(DIM);
   std::vector<Scalar> fhist;
 
-  Scalar f = fEval(x);
-  gEval(x, g);
+  Scalar f = fgEval(x, g);
   fhist.push_back(f);
   Scalar fbest = f;
   xbest = x;
@@ -787,9 +788,11 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       f = ftry;
       this->postStep(x);
       clampToBox(x);
+      // both at the same point, so one sweep; see NGPA's twin below
       if (x != xnew)
-        f = fEval(x);
-      gEval(x, g);
+        f = fgEval(x, g);
+      else
+        gEval(x, g);
       s = x - xprev;
       yv = g - gprev;
 
@@ -914,13 +917,14 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       f = ftry;
       this->postStep(x);
       clampToBox(x);
-      if (x != xnew) {
-        f = fEval(x);
+      const bool moved = (x != xnew);
+      if (moved)
         haveGrad = false;
-      }
       pg_old = pg;
       if (haveGrad)
         g = gnew;
+      else if (moved)
+        f = fgEval(x, g);     // one sweep for the pair, see above
       else
         gEval(x, g);
       s = x - xprev;
