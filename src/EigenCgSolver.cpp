@@ -55,6 +55,7 @@ EigenCgSolver<Func>::to_search_rule(const std::string & token)
 {
   if (token == "arc") return SEARCH_ARC;
   if (token == "hz")  return SEARCH_HZ;
+  if (token == "awolfe") return SEARCH_AWOLFE;
   throw std::runtime_error("eigencg: unknown line search '" + token + "'");
 }
 
@@ -144,6 +145,97 @@ EigenCgSolver<Func>::maxFeasibleStep(const InputType & x, const InputType & d) c
       amax = MAX(room, (Scalar)0);
   }
   return amax;
+}
+
+template <typename Func>
+bool
+EigenCgSolver<Func>::lineSearchAWolfe(const InputType & x, const JacobianType & g,
+                                      const InputType & d, Scalar & alpha,
+                                      Scalar & fval, InputType & xnew,
+                                      JacobianType & gnew) const
+{
+  using std::abs;
+  const Scalar f0 = fval;
+  const Scalar delta = (Scalar)_c1, sigma = (Scalar)_c2;
+  // HZ's eps_k: the band in which f is too flat to compare values, so the
+  // approximate Wolfe test takes over from the Armijo one
+  const Scalar epsk = (Scalar)1e-6 * abs(f0);
+
+  /* phi'(0) counts only the components the arc can actually move: one held
+   * against its bound contributes nothing however large its gradient. */
+  Scalar dphi0 = 0;
+  for (int i = 0; i < x.rows(); i++) {
+    const Scalar di = d(i);
+    if (di == 0) continue;
+    if ((x(i) <= _lb(i) && di < 0) || (x(i) >= _ub(i) && di > 0)) continue;
+    dphi0 += g(i) * di;
+  }
+  if (!(dphi0 < 0))
+    return false;
+
+  InputType xa(x.rows());
+  JacobianType ga(x.rows());
+  Scalar fa = f0, gda = 0;
+
+  // phi and phi' at a, on the arc; gda is the displacement the Armijo test uses
+  auto eval = [&](Scalar a) {
+    xa = x + a * d;
+    clampToBox(xa);
+    fa = fgEval(xa, ga);
+    gda = g.dot(xa - x);
+    Scalar s = 0;
+    for (int i = 0; i < x.rows(); i++)
+      if (xa(i) > _lb(i) && xa(i) < _ub(i)) s += ga(i) * d(i);
+    return s;
+  };
+  auto acceptable = [&](Scalar dphi) {
+    if (!std::isfinite(fa))
+      return false;
+    // strong Wolfe: a weak test accepts an overshoot, where |phi'| is large
+    // and positive, and an overshot step is what the arc search already avoids
+    if (fa <= f0 + delta * gda && abs(dphi) <= sigma * abs(dphi0))
+      return true;
+    // approximate Wolfe, usable only once f is inside the flat band
+    return fa <= f0 + epsk && abs(dphi) <= sigma * abs(dphi0);
+  };
+  auto commit = [&](Scalar a) {
+    alpha = a; fval = fa; xnew = xa; gnew = ga;
+  };
+
+  Scalar lo = 0, dlo = dphi0, hi = 0, dhi = 0;
+  bool bracketed = false;
+  Scalar a = (alpha > 0 && std::isfinite(alpha)) ? alpha : 1;
+
+  for (int i = 0; i < _maxExpand; i++) {
+    const Scalar dphi = eval(a);
+    if (acceptable(dphi)) { commit(a); return true; }
+    if (dphi >= 0 || !(fa <= f0 + delta * gda) || !std::isfinite(fa)) {
+      hi = a; dhi = dphi; bracketed = true; break;   // minimum is below a
+    }
+    if (xa == x)
+      return false;                                  // step underflowed
+    lo = a; dlo = dphi;
+    a *= 5;
+  }
+  if (!bracketed)
+    return false;
+
+  for (int i = 0; i < 40; i++) {
+    Scalar t = (lo + hi) / 2;
+    if (dhi != dlo) {                                // secant on the derivative
+      const Scalar q = lo - dlo * (hi - lo) / (dhi - dlo);
+      if (q > lo && q < hi) t = q;
+    }
+    const Scalar w = (Scalar)0.1 * (hi - lo);        // keep it off the ends
+    t = MAX(lo + w, MIN(hi - w, t));
+    if (!(t > lo && t < hi))
+      return false;
+    const Scalar dphi = eval(t);
+    if (acceptable(dphi)) { commit(t); return true; }
+    if (dphi >= 0 || !(fa <= f0 + delta * gda)) { hi = t; dhi = dphi; }
+    else { lo = t; dlo = dphi; }
+  }
+  return false;
 }
 
 template <typename Func>
@@ -883,11 +975,16 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
       Scalar ftry = f;
       bool haveGrad = false;
       bool searched = true;
-      if (searchRule == SEARCH_HZ &&
+      if (searchRule == SEARCH_AWOLFE &&
+          lineSearchAWolfe(x, g, dcg, step, ftry, xnew, gnew))
+        haveGrad = true;
+      else if (searchRule == SEARCH_HZ &&
           lineSearchHz(x, g, dcg, step, ftry, xnew, gnew))
         haveGrad = true;
-      else
+      else {
+        ftry = f;
         searched = lineSearch(x, g, dcg, step, ftry, f, xnew);
+      }
       /* A search that reports success with a step so short that neither x nor
        * f moves is not progress, and has to be caught here: it leaves the
        * search happy and the iterate exactly where it was, so the UA spins on

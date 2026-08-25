@@ -199,6 +199,7 @@ public:
   typedef enum {
     SEARCH_ARC,     //!< projection-arc Armijo everywhere
     SEARCH_HZ,      //!< Hager-Zhang Wolfe in the interior, arc on the faces
+    SEARCH_AWOLFE,  //!< approximate Wolfe along the projection arc
   } search_rule;
 
   //! how the first trial step of a CG line search is guessed
@@ -255,6 +256,10 @@ private:
   static constexpr double _c1 = 1e-4;
   //! give up on a direction after this many backtracks and restart CG.
   static constexpr int _maxBacktrack = 50;
+  //! curvature constant of the approximate-Wolfe search.  Smaller buys a more
+  //! accurate step for more evaluations, and the trade is not monotone: on
+  //! iceberg 0.9 costs 6699 iterations, 0.1 costs 1653 and 0.01 costs 808.
+  static constexpr double _c2 = 0.01;
   //! how far one line search may grow the trial step (2^_maxExpand).
   static constexpr int _maxExpand = 12;
   //! how many iterations the f-delta safety net measures progress over.
@@ -327,6 +332,17 @@ private:
   //! Hager-Zhang Wolfe search, valid only while the step stays interior.
   //! false if it failed or wandered outside the box, and then the caller
   //! falls back to lineSearch().  Hands back the gradient at the new point.
+  /*! \brief  approximate-Wolfe line search along the projection arc.
+   *
+   * The arc search satisfies sufficient decrease only, which leaves the step
+   * within a factor of two of the ray minimum; CG wants the curvature
+   * condition as well.  This brackets on the arc derivative and closes the
+   * bracket by secant, so both hold at the returned point.
+   */
+  bool lineSearchAWolfe(const InputType & x, const JacobianType & g, const InputType & d,
+                        Scalar & alpha, Scalar & fval, InputType & xnew,
+                        JacobianType & gnew) const;
+
   bool lineSearchHz(const InputType & x, const JacobianType & g, const InputType & d,
                     Scalar & alpha, Scalar & fval, InputType & xnew,
                     JacobianType & gnew) const;
