@@ -155,11 +155,27 @@ EigenCgSolver<Func>::lineSearchAWolfe(const InputType & x, const JacobianType & 
                                       JacobianType & gnew) const
 {
   using std::abs;
+  /* With a postStep projection (--rescale) the point this search evaluates is
+   * not the point the solver takes, so a Wolfe point on the box arc is the
+   * wrong target and the interval loop grinds looking for one: 84 trials an
+   * iteration on iceberg --rescale, against 2.5 without it.  lineSearch()
+   * refuses to shrink for the same reason, and it takes this case. */
+  if (this->_post)
+    return false;
+
   const Scalar f0 = fval;
   const Scalar delta = (Scalar)_c1, sigma = (Scalar)_c2;
-  // HZ's eps_k: the band in which f is too flat to compare values, so the
-  // approximate Wolfe test takes over from the Armijo one
-  const Scalar epsk = (Scalar)1e-6 * abs(f0);
+
+  /* eps_k, the width of the band in which comparing function values is noise
+   * and the approximate test takes over.  Hager & Zhang make it eps*C_k with
+   * C_k a decaying average of |f| (TOMS 32 (2006) 113, (4.2)), and the decay
+   * is the whole point: the band has to follow f down.  A fixed 1e-6|f_0| does
+   * not, and it gated the approximate test out of all 4858 trials of an
+   * iceberg run -- so that search was a strong Wolfe search wearing this
+   * function's name, and sigma had to be driven to 0.01 to pay for it. */
+  _awQ = 1 + (Scalar)_awDecay * _awQ;
+  _awC += (abs(f0) - _awC) / _awQ;
+  const Scalar epsk = (Scalar)_awEps * _awC;
 
   /* phi'(0) counts only the components the arc can actually move: one held
    * against its bound contributes nothing however large its gradient. */
@@ -172,68 +188,182 @@ EigenCgSolver<Func>::lineSearchAWolfe(const InputType & x, const JacobianType & 
   }
   if (!(dphi0 < 0))
     return false;
+  _awSearches++;
 
   InputType xa(x.rows());
   JacobianType ga(x.rows());
-  Scalar fa = f0, gda = 0;
+  Scalar fa = f0, gda = 0, dphia = 0;
+  bool haveD = false;
 
-  // phi and phi' at a, on the arc; gda is the displacement the Armijo test uses
-  auto eval = [&](Scalar a) {
-    xa = x + a * d;
-    clampToBox(xa);
-    fa = fgEval(xa, ga);
-    gda = g.dot(xa - x);
+  auto arcSlope = [&]() {
     Scalar s = 0;
     for (int i = 0; i < x.rows(); i++)
       if (xa(i) > _lb(i) && xa(i) < _ub(i)) s += ga(i) * d(i);
     return s;
   };
-  auto acceptable = [&](Scalar dphi) {
-    if (!std::isfinite(fa))
+  /* Three ways to price a trial.  A gradient costs about four values here, so
+   * a trial a value alone can reject never asks for one: value() is the whole
+   * cost of a step that overshot, and slope() is only spent where the
+   * curvature condition has to be tested. */
+  auto value = [&](Scalar a) {
+    xa = x + a * d;
+    clampToBox(xa);
+    gda = g.dot(xa - x);
+    fa = fEval(xa);
+    haveD = false;
+    _awTrials++;
+  };
+  auto slope = [&]() {
+    gEval(xa, ga);
+    dphia = arcSlope();
+    haveD = true;
+  };
+  //! both at once, for a trial we expect to accept -- one fused sweep, where
+  //! value() then slope() at the same point would be five f-units instead of four
+  auto valueSlope = [&](Scalar a) {
+    xa = x + a * d;
+    clampToBox(xa);
+    gda = g.dot(xa - x);
+    fa = fgEval(xa, ga);
+    dphia = arcSlope();
+    haveD = true;
+    _awTrials++;
+  };
+  /*! The two tests of HZ (4.1).  Neither is the *strong* Wolfe condition: the
+   * decrease test already rules out the overshoot that |phi'| <= sigma|phi'(0)|
+   * was there to catch, and asking for both bought a line minimizer at every
+   * iteration and paid for it in trials.  The approximate branch replaces the
+   * decrease test -- which is meaningless once f is flat to within eps_k -- by
+   * an upper bound on the slope, and is valid only inside that band. */
+  auto wolfe = [&]() {
+    if (!std::isfinite(fa) || !haveD)
       return false;
-    // strong Wolfe: a weak test accepts an overshoot, where |phi'| is large
-    // and positive, and an overshot step is what the arc search already avoids
-    if (fa <= f0 + delta * gda && abs(dphi) <= sigma * abs(dphi0))
+    if (fa <= f0 + delta * gda && dphia >= sigma * dphi0)
       return true;
-    // approximate Wolfe, usable only once f is inside the flat band
-    return fa <= f0 + epsk && abs(dphi) <= sigma * abs(dphi0);
+    if (fa > f0 + epsk)
+      return false;
+    if (dphia >= sigma * dphi0 && dphia <= (2 * delta - 1) * dphi0) {
+      _awApprox++;
+      return true;
+    }
+    return false;
   };
   auto commit = [&](Scalar a) {
     alpha = a; fval = fa; xnew = xa; gnew = ga;
   };
 
-  Scalar lo = 0, dlo = dphi0, hi = 0, dhi = 0;
-  bool bracketed = false;
+  /* The bracket [lo, hi].  lo keeps phi(lo) <= phi(0) + eps_k and phi'(lo) < 0;
+   * hi is either a point with phi'(hi) >= 0, or -- and this is what lets a
+   * value reject a trial on its own -- a point whose value is above the band,
+   * which puts a minimizer below it just as surely. */
+  Scalar lo = 0, flo = f0, dlo = dphi0;
+  Scalar hi = 0, fhi = 0, dhi = 0;
+  bool haveHi = false, hiHasD = false;
   Scalar a = (alpha > 0 && std::isfinite(alpha)) ? alpha : 1;
 
-  for (int i = 0; i < _maxExpand; i++) {
-    const Scalar dphi = eval(a);
-    if (acceptable(dphi)) { commit(a); return true; }
-    if (dphi >= 0 || !(fa <= f0 + delta * gda) || !std::isfinite(fa)) {
-      hi = a; dhi = dphi; bracketed = true; break;   // minimum is below a
+  /* I1, the QuadStep: one *value* at psi1*a, and if the quadratic through
+   * phi(0), phi'(0) and that value is strongly convex, start from its
+   * minimizer instead of from a.  This is where asa_cg's 1.36 standalone f
+   * per iteration go, and it is what lets its search accept on the first
+   * trial: the caller's Shanno-Phua guess carries no curvature along d, so
+   * without this the search either accepts a poor point (at sigma 0.9) or
+   * spends trials fixing the guess (at sigma 0.01). */
+  const Scalar R = (Scalar)_awPsi1 * a;
+  value(R);
+  if (std::isfinite(fa) && fa <= f0) {
+    const Scalar den = 2 * (fa - f0 - dphi0 * R);
+    if (den > 0) {                        // strongly convex
+      const Scalar q = -dphi0 * R * R / den;
+      if (q > 0 && std::isfinite(q))
+        a = q;
+    }
+  }
+
+  /* B0-B3: expand until the bracket closes.  Every trial here needs phi' to
+   * decide whether to go on, so every trial here is fused. */
+  for (int i = 0; i < _maxExpand && !haveHi; i++) {
+    valueSlope(a);
+    if (wolfe()) { commit(a); return true; }
+    if (!std::isfinite(fa) || fa > f0 + epsk || dphia >= 0) {
+      hi = a; fhi = fa; dhi = dphia; haveHi = true;
+      hiHasD = std::isfinite(fa) && dphia >= 0;
+      break;
     }
     if (xa == x)
       return false;                                  // step underflowed
-    lo = a; dlo = dphi;
-    a *= 5;
+    /* The next trial by secant on phi' rather than a fixed ratio: both slopes
+     * are already paid for, and a factor of 5 makes every overshoot a full
+     * evaluation of a point nobody wanted. */
+    Scalar next = (Scalar)_awRho * a;
+    if (dphia > dlo) {
+      const Scalar t = (lo * dphia - a * dlo) / (dphia - dlo);
+      if (t > a)
+        next = MIN(MAX(t, (Scalar)1.5 * a), (Scalar)_awRho * 2 * a);
+    }
+    lo = a; flo = fa; dlo = dphia;
+    a = next;
   }
-  if (!bracketed)
+  if (!haveHi)
     return false;
 
+  /* L0-L3 with secant2 (S1-S4): two secant steps a pass, the second on the
+   * side that moved, so both ends improve rather than one end and a bisection.
+   * Flattened into one probe per turn, with `sameSide` alternating the pair
+   * the secant is taken over. */
+  bool sameSide = false, forceBisect = false, movedHi = false, oldHasD = false;
+  Scalar oldA = 0, oldD = 0, width = hi - lo;
+
   for (int i = 0; i < 40; i++) {
-    Scalar t = (lo + hi) / 2;
-    if (dhi != dlo) {                                // secant on the derivative
-      const Scalar q = lo - dlo * (hi - lo) / (dhi - dlo);
-      if (q > lo && q < hi) t = q;
+    Scalar c;
+    const Scalar w = (Scalar)0.1 * (hi - lo);
+    if (forceBisect)
+      c = (lo + hi) / 2;
+    else if (sameSide && oldHasD && (!movedHi || hiHasD)) {
+      const Scalar b = movedHi ? hi : lo, db = movedHi ? dhi : dlo;
+      c = (db != oldD) ? (oldA * db - b * oldD) / (db - oldD) : (lo + hi) / 2;
     }
-    const Scalar w = (Scalar)0.1 * (hi - lo);        // keep it off the ends
-    t = MAX(lo + w, MIN(hi - w, t));
-    if (!(t > lo && t < hi))
+    else if (hiHasD && dhi > dlo)
+      c = (lo * dhi - hi * dlo) / (dhi - dlo);        // secant on phi'
+    else if (std::isfinite(fhi)) {
+      // no slope at hi: the quadratic through phi(lo), phi'(lo), phi(hi)
+      const Scalar wid = hi - lo;
+      const Scalar den = 2 * (fhi - flo - dlo * wid);
+      c = den > 0 ? lo - dlo * wid * wid / den : (lo + hi) / 2;
+    }
+    else
+      c = (lo + hi) / 2;
+    c = MAX(lo + w, MIN(hi - w, c));
+    if (!(c > lo && c < hi))
       return false;
-    const Scalar dphi = eval(t);
-    if (acceptable(dphi)) { commit(t); return true; }
-    if (dphi >= 0 || !(fa <= f0 + delta * gda)) { hi = t; dhi = dphi; }
-    else { lo = t; dlo = dphi; }
+
+    // value first; only a trial the value cannot reject is worth a gradient
+    value(c);
+    if (!std::isfinite(fa) || fa > f0 + epsk) {
+      oldA = hi; oldD = dhi; oldHasD = hiHasD;
+      hi = c; fhi = fa; dhi = 0; hiHasD = false;
+      movedHi = true;
+    }
+    else {
+      slope();
+      if (wolfe()) { commit(c); return true; }
+      if (xa == x)
+        return false;
+      if (dphia >= 0) {
+        oldA = hi; oldD = dhi; oldHasD = hiHasD;
+        hi = c; fhi = fa; dhi = dphia; hiHasD = true;
+        movedHi = true;
+      }
+      else {
+        oldA = lo; oldD = dlo; oldHasD = true;
+        lo = c; flo = fa; dlo = dphia;
+        movedHi = false;
+      }
+    }
+    // L2: an interval that will not shrink gets bisected next turn
+    const Scalar now = hi - lo;
+    forceBisect = now > (Scalar)_awGamma * width;
+    sameSide = !forceBisect && !sameSide;
+    width = now;
   }
   return false;
 }
@@ -448,6 +578,8 @@ EigenCgSolver<Func>::internalSolve(InputType & x0)
   clampToBox(x);
 
   _ngpaIters = _uaIters = _uEmpty = _nf = _ng = 0;
+  _awTrials = _awApprox = _awSearches = 0;
+  _awQ = _awC = 0;
   settings.numIters = 0;
 
   if (mode == MODE_PCG)
@@ -586,11 +718,16 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
      * cross a face, and on these problems most of the rf saturates. */
     bool haveGrad = false;
     bool searched = true;
-    if (searchRule == SEARCH_HZ &&
+    if (searchRule == SEARCH_AWOLFE &&
+        lineSearchAWolfe(x, g, d, step, f_try, xnew, gnew))
+      haveGrad = true;
+    else if (searchRule == SEARCH_HZ &&
         lineSearchHz(x, g, d, step, f_try, xnew, gnew))
       haveGrad = true;
-    else
+    else {
+      f_try = f;
       searched = lineSearch(x, g, d, step, f_try, fref, xnew);
+    }
     // a step that moves neither x nor f is not progress, whatever the search
     // says; see the same test in the UA
     if (searched && (xnew == x || !(f_try < fref)))
@@ -692,7 +829,10 @@ EigenCgSolver<Func>::solveSimple(InputType & x)
               // it wanted to beat: the only way to tell a converged run from
               // one the budget or the f-delta net cut off mid-descent
               << " (pg=" << pgnorm << " gradTol=" << settings.gradTol
-              << " nf=" << _nf << " ng=" << _ng << ")\n";
+              << " nf=" << _nf << " ng=" << _ng << ")\n"
+              << "  awolfe: searches=" << _awSearches
+              << " trials=" << _awTrials
+              << " approx-accepts=" << _awApprox << "\n";
 }
 
 /*! \brief The Hager-Zhang active set algorithm, ASA.
@@ -1158,7 +1298,10 @@ EigenCgSolver<Func>::solveAsa(InputType & x)
               << " (pg=" << pgInf << " gradTol=" << settings.gradTol
               << " ngpa=" << _ngpaIters << " ua=" << _uaIters
               << " Uempty=" << _uEmpty
-              << " nf=" << _nf << " ng=" << _ng << ")\n";
+              << " nf=" << _nf << " ng=" << _ng << ")\n"
+              << "  awolfe: searches=" << _awSearches
+              << " trials=" << _awTrials
+              << " approx-accepts=" << _awApprox << "\n";
 }
 
 }

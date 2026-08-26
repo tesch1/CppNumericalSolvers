@@ -163,9 +163,8 @@ namespace pwie
  * ISolver::postStep().  A parameterization whose feasible set is not a box
  * (cartesian --rescale: |rf| <= b1max is a disc) needs that hook.
  *
- * Written from the two published papers.  No code was taken from, and no part
- * of, the GPL asa_cg.c that AsaCgSolver wraps was read.  The vendored
- * hager_zhang.h is MIT, from upstream CppNumericalSolvers.
+ * A clean-room implementation, written from the two published papers.  The
+ * vendored hager_zhang.h is MIT, from upstream CppNumericalSolvers.
  */
 template <typename Func>
 class EigenCgSolver : public ISolver<Func>
@@ -199,7 +198,7 @@ public:
   typedef enum {
     SEARCH_ARC,     //!< projection-arc Armijo everywhere
     SEARCH_HZ,      //!< Hager-Zhang Wolfe in the interior, arc on the faces
-    SEARCH_AWOLFE,  //!< approximate Wolfe along the projection arc
+    SEARCH_AWOLFE,  //!< Hager-Zhang's search along the projection arc
   } search_rule;
 
   //! how the first trial step of a CG line search is guessed
@@ -256,10 +255,36 @@ private:
   static constexpr double _c1 = 1e-4;
   //! give up on a direction after this many backtracks and restart CG.
   static constexpr int _maxBacktrack = 50;
-  //! curvature constant of the approximate-Wolfe search.  Smaller buys a more
-  //! accurate step for more evaluations, and the trade is not monotone: on
-  //! iceberg 0.9 costs 6699 iterations, 0.1 costs 1653 and 0.01 costs 808.
-  static constexpr double _c2 = 0.01;
+  /*! Curvature constant of the approximate-Wolfe search.  CG_DESCENT runs at
+   * 0.9; this is 0.1 on the measurement below, and the point of the number is
+   * that it is no longer load-bearing.  Median f-units over three seeds
+   * (a gradient or a fused pair is 4 f-units), against asa_cg:
+   *
+   *   example                       asa_cg   sigma .9   .1     .01
+   *   iceberg cartesian               5172      9626   7058   13287
+   *   burbop_ur90 cartesian          19755     16050  14576   12636
+   *   sburbop_ur180_short            2256       3355   3055    6814
+   *   iceberg ampangle, gtol 1e-8    47300     29011  33674   66239
+   *
+   * 0.1 wins the paired comparison against 0.9 on 7 of those 10 runs and has
+   * the better worst case (1.36x asa_cg against 1.86x), so it is the default;
+   * 0.9 costs about 6% more overall and either is defensible.  What is no
+   * longer defensible is 0.01, which was this constant before the approximate
+   * test was fixed: it is 60% worse than 0.1 here, and it was 0.01 only
+   * because the search it belonged to was a *strong* Wolfe search that could
+   * not otherwise find an accurate enough step.
+   */
+  static constexpr double _c2 = 0.1;
+  //! the approximate-Wolfe search, all from Hager & Zhang, ACM TOMS 32 (2006)
+  //! 113: eps and the decay of the C_k average that eps_k is built from,
+  //! their bracket expansion factor rho, and gamma, the shrink one pass of
+  //! the interval loop has to achieve before the next one bisects instead.
+  static constexpr double _awEps = 1e-6;
+  static constexpr double _awDecay = 0.7;
+  static constexpr double _awRho = 5;
+  //! psi1 of their initial-step rule I1, the QuadStep's value probe
+  static constexpr double _awPsi1 = 0.1;
+  static constexpr double _awGamma = 0.66;
   //! how far one line search may grow the trial step (2^_maxExpand).
   static constexpr int _maxExpand = 12;
   //! how many iterations the f-delta safety net measures progress over.
@@ -273,6 +298,13 @@ private:
   //! not counted here; SEARCH_ARC, the default, is.
   mutable size_t _nf = 0;
   mutable size_t _ng = 0;
+  //! how many trials the approximate-Wolfe search spent, and how many of its
+  //! acceptances the approximate branch is responsible for.  The second number
+  //! is the one that says whether this is an approximate Wolfe search at all.
+  mutable size_t _awTrials = 0, _awApprox = 0, _awSearches = 0;
+  //! Q_k and C_k of (4.2), the decaying average |f| that eps_k is a fraction
+  //! of.  State of the run, not of one line search.
+  mutable Scalar _awQ = 0, _awC = 0;
 
   Scalar fEval(const InputType & x) const { _nf++; return _functor.f(x); }
   void gEval(const InputType & x, JacobianType & g) const
@@ -336,8 +368,36 @@ private:
    *
    * The arc search satisfies sufficient decrease only, which leaves the step
    * within a factor of two of the ray minimum; CG wants the curvature
-   * condition as well.  This brackets on the arc derivative and closes the
-   * bracket by secant, so both hold at the returned point.
+   * condition as well.  This is Hager & Zhang's line search -- the QuadStep
+   * I1, bracket B0-B3, update U0-U3 and secant2 S1-S4 of ACM TOMS 32 (2006)
+   * 113 -- on the arc, so both conditions hold at the returned point.
+   *
+   * It was none of those things when it was written, and the measurement that
+   * says so is one counter.  Its approximate branch was gated behind a *fixed*
+   * eps_k = 1e-6|f_0| and still asked for the strong |phi'| <= sigma|phi'(0)|,
+   * so on an iceberg run it decided 0 of 4858 trials: what ran was a strong
+   * Wolfe search at sigma = 0.01, and sigma was 0.01 because that was the only
+   * way such a search could find an accurate step.  Three things followed
+   * from fixing it, priced in f-units on iceberg (a gradient or a fused pair
+   * is 4 f-units, 919 iterations of the old search cost 19658 of them):
+   *
+   * - the real test.  eps_k decays with |f| (their C_k average), and the
+   *   approximate branch bounds the slope above instead of keeping the strong
+   *   test.  On its own that made sigma harmless -- 6832 iterations at 0.9
+   *   against 6699 before -- but no cheaper.
+   * - I1, the QuadStep.  One *value* at psi1*alpha and a quadratic through it
+   *   picks the first trial, and that is where the iterations went: 6832 ->
+   *   1602 at sigma 0.9, and 1.14 gradients an iteration, which is asa_cg's
+   *   1.25.  A Shanno-Phua guess carries no curvature along d, so without
+   *   this the search either accepted a poor point or paid trials to fix it.
+   * - values before gradients.  A trial whose value is above the band cannot
+   *   be accepted under either test and puts a minimizer below it, so it
+   *   never asks for the gradient a fused evaluation would have paid for.
+   *   Same iterates, same answer, 16-36% fewer f-units.
+   *
+   * 5.29 trials and 20.88 f-units an iteration became 2.8 and 6.3, against
+   * asa_cg's 2.65 and 6.37.  What is left of the old gap is iteration count,
+   * which is the CG's asymptotic rate and is discussed above.
    */
   bool lineSearchAWolfe(const InputType & x, const JacobianType & g, const InputType & d,
                         Scalar & alpha, Scalar & fval, InputType & xnew,
