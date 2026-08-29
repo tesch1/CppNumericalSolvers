@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <vector>
 
@@ -66,10 +67,17 @@ void ComputeFiniteGradient(
   VectorType x = x0;
 
   const int innerSteps = 2 * (accuracy + 1);
+  // The step has to follow the stencil `accuracy` selects.  Total error is
+  // ~h^order from truncation plus ~eps/h from cancellation, minimized at
+  // h ~ eps^(1/(order+1)).  A fixed sqrt(eps) puts every stencil above
+  // accuracy 0 deep in the round-off regime, where the extra order buys
+  // nothing and only costs function evaluations.
+  const int order = 2 * (accuracy + 1);
+  const ScalarType h_rel =
+      std::pow(machine_eps, ScalarType(1) / ScalarType(order + 1));
   for (index_t d = 0; d < x0.rows(); d++) {
     // Compute a coordinate-dependent step size.
-    ScalarType h =
-        std::sqrt(machine_eps) * std::max(std::abs(x0[d]), ScalarType(1));
+    ScalarType h = h_rel * std::max(std::abs(x0[d]), ScalarType(1));
     ScalarType ddVal = dd[accuracy] * h;
     (*grad)[d] = 0;
     for (int s = 0; s < innerSteps; ++s) {
