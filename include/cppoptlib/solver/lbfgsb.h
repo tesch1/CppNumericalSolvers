@@ -86,6 +86,11 @@ class Lbfgsb
     this->stopping_progress.f_delta_relative = true;
   }
 
+  //! How many (s,y) pairs to keep.  Defaults to the template parameter; the
+  //! histories are dynamic matrices, so this can be set per solve.
+  void SetMemory(int k) { memory_ = k > 0 ? k : 1; }
+  int Memory() const { return memory_; }
+
   void SetBounds(const VectorType& lower_bound, const VectorType& upper_bound) {
     lower_bound_ = lower_bound;
     upper_bound_ = upper_bound;
@@ -209,12 +214,12 @@ class Lbfgsb
     // STEP 6: Only update if positive curvature (s'*y > 0)
     const ScalarType sTy = new_s.dot(new_y);
     if (sTy > ScalarType(1e-7) * new_y.squaredNorm()) {
-      if (y_history_.cols() < m) {
+      if (y_history_.cols() < memory_) {
         y_history_.conservativeResize(dim_, y_history_.cols() + 1);
         s_history_.conservativeResize(dim_, s_history_.cols() + 1);
       } else {
-        y_history_.leftCols(m - 1) = y_history_.rightCols(m - 1).eval();
-        s_history_.leftCols(m - 1) = s_history_.rightCols(m - 1).eval();
+        y_history_.leftCols(memory_ - 1) = y_history_.rightCols(memory_ - 1).eval();
+        s_history_.leftCols(memory_ - 1) = s_history_.rightCols(memory_ - 1).eval();
       }
       y_history_.rightCols(1) = new_y;
       s_history_.rightCols(1) = new_s;
@@ -518,6 +523,7 @@ class Lbfgsb
 
  private:
   int dim_;
+  int memory_ = m;      // (s,y) pairs kept; SetMemory overrides
   VectorType lower_bound_;
   VectorType upper_bound_;
   bool bounds_initialized_ = false;
