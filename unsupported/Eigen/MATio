@@ -254,6 +254,9 @@ public:
       return -1;
     }
 
+    // Mat_VarWrite appends: writing a name the file already holds leaves two
+    // of it and a reader takes the first, so a second write is invisible.
+    Mat_VarDelete(_file, const_cast<char *>(matname));
     // \TODO - thread safety
     int status = Mat_VarWrite(_file, var, compression);
     if (status) {
